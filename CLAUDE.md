@@ -9,12 +9,11 @@ This MCP server provides Claude with the ability to manage Buxfer financial tran
 - **Language**: Python 3.11
 - **Framework**: FastMCP (MCP SDK)
 - **HTTP Client**: httpx (async)
-- **Container**: Docker
+- **Execution**: Run directly via Python (no Docker required)
 - **Transport**: stdio (standard input/output)
 
 ### Security Features
 - **Token Authentication**: Uses pre-obtained Buxfer API token
-- **Non-root Container**: Runs as user `mcpuser` (UID 1000)
 - **Environment Variables**: Credentials stored securely in Claude config
 - **HTTPS Only**: All API communications encrypted
 - **No Password Storage**: Only ephemeral tokens used
@@ -117,25 +116,23 @@ All tools return formatted strings with:
 {
   "mcpServers": {
     "buxfer": {
-      "command": "docker",
+      "command": "/absolute/path/to/buxfer-mcp-server/.venv/bin/python",
       "args": [
-        "run",
-        "-i",
-        "--rm",
-        "-e",
-        "BUXFER_TOKEN=your_actual_token_here",
-        "buxfer-mcp-server"
-      ]
+        "/absolute/path/to/buxfer-mcp-server/buxfer_server.py"
+      ],
+      "env": {
+        "BUXFER_TOKEN": "your_actual_token_here"
+      }
     }
   }
 }
 ```
 
 ### Configuration Notes
-- Token passed via `-e` flag to Docker
-- `--rm` ensures container cleanup after use
-- `-i` enables interactive mode for stdio transport
-- Server name "buxfer" can be customized
+- The server runs directly via Python; Docker is not used.
+- `command` should point at the Python interpreter that has the dependencies installed (a `.venv` is recommended).
+- Token passed via the `env` object as `BUXFER_TOKEN`.
+- Server name "buxfer" can be customized.
 
 ## Usage Patterns
 
@@ -219,14 +216,13 @@ All tools return formatted strings with:
 - Rate limiting may apply (not documented)
 
 ### Server Limitations
-- Read-only for most endpoints (except add_transaction)
-- No transaction editing/deletion in current version
-- No budget or reminder management
+- Read-only for most endpoints (except add_transaction and edit_transaction)
+- No transaction deletion in current version
+- No reminder management
 - No loan/group/contact management
 
-### Docker Limitations
-- Requires Docker to be running
-- Container starts fresh each time (no state persistence)
+### Runtime Limitations
+- Requires Python 3.11+ with dependencies installed
 - Network access required for API calls
 
 ## Troubleshooting Guide
@@ -240,7 +236,6 @@ All tools return formatted strings with:
 
 **"Connection refused"**
 - Check internet connectivity
-- Verify Docker is running
 - Test Buxfer API availability
 
 **"Unexpected response format"**
@@ -248,17 +243,15 @@ All tools return formatted strings with:
 - Check Buxfer API status
 - Verify token is still valid
 
-**Docker build failures**
-- Ensure all files present
-- Check Docker daemon status
-- Verify Python base image availability
+**"Module not found" / import errors**
+- Ensure dependencies are installed (`pip install -r requirements.txt`)
+- Confirm `command` points at the interpreter where they were installed
 
 ### Debugging Steps
 
-1. **Check Docker**:
+1. **Check Dependencies**:
    ```bash
-   docker ps
-   docker images | grep buxfer
+   .venv/bin/python -c "import mcp, httpx; print('ok')"
    ```
 
 2. **Test API Manually**:
@@ -311,10 +304,7 @@ result = await make_buxfer_request("GET", "endpoint", params={})
 return format_new_data(result)
 ```
 
-4. **Rebuild Docker image**:
-```bash
-docker build -t buxfer-mcp-server .
-```
+4. **Restart Claude Desktop** to pick up the new tool.
 
 ## Security Considerations
 
@@ -327,14 +317,14 @@ docker build -t buxfer-mcp-server .
 ### Data Privacy
 - All data stays between user, Claude, and Buxfer
 - No third-party data sharing
-- Container ephemeral (no data persistence)
+- No data persistence (no local storage of financial data)
 - Logs contain no sensitive information
 
 ### Best Practices
 1. Use strong Buxfer password
 2. Regenerate token if compromised
 3. Don't share Claude config file
-4. Keep Docker images updated
+4. Keep Python dependencies updated
 5. Monitor API usage for anomalies
 
 ## Performance Considerations
@@ -355,9 +345,8 @@ docker build -t buxfer-mcp-server .
 
 ### Regular Tasks
 1. **Token Refresh**: When expired or compromised
-2. **Docker Updates**: Keep base image current
-3. **Dependency Updates**: Update Python packages
-4. **API Monitoring**: Watch for Buxfer API changes
+2. **Dependency Updates**: Update Python packages
+3. **API Monitoring**: Watch for Buxfer API changes
 
 ### Update Procedure
 ```bash
@@ -365,10 +354,8 @@ docker build -t buxfer-mcp-server .
 cd buxfer-mcp-server
 
 # Update dependencies if needed
-# Edit requirements.txt
-
-# Rebuild image
-docker build -t buxfer-mcp-server .
+source .venv/bin/activate
+pip install -r requirements.txt
 
 # Restart Claude Desktop
 # No config changes needed if token unchanged
@@ -379,12 +366,11 @@ docker build -t buxfer-mcp-server .
 ### Documentation
 - Buxfer API: https://www.buxfer.com/help/api/
 - FastMCP: https://github.com/modelcontextprotocol/python-sdk
-- Docker: https://docs.docker.com/
+- Python: https://docs.python.org/3/
 
 ### Community
 - MCP Discord: For MCP-related questions
 - Buxfer Support: For API-specific issues
-- Docker Forums: For container issues
 
 ---
 

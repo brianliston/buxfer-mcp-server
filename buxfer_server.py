@@ -175,14 +175,32 @@ async def list_accounts() -> str:
         logger.error(f"Error listing accounts: {e}")
         return f"❌ Error: {str(e)}"
 
+MAX_AUTO_PAGES = 60  # safety cap when auto-paginating client-side filters (~6000 txns)
+MAX_DISPLAY = 200    # cap on how many transactions to render in one response
+
+async def fetch_all_transactions(params):
+    """Fetch all pages for the given server-side filters. Returns (transactions, num_total, truncated)."""
+    first = await make_buxfer_request("GET", "transactions", params={**params, "page": 1})
+    resp = first.get("response", {})
+    transactions = list(resp.get("transactions", []))
+    num_total = int(resp.get("numTransactions", 0))
+    total_pages = (num_total + 99) // 100
+    pages_to_fetch = min(total_pages, MAX_AUTO_PAGES)
+
+    for p in range(2, pages_to_fetch + 1):
+        r = await make_buxfer_request("GET", "transactions", params={**params, "page": p})
+        transactions.extend(r.get("response", {}).get("transactions", []))
+
+    return transactions, num_total, total_pages > MAX_AUTO_PAGES
+
 @mcp.tool()
-async def list_transactions(account_id: str = "", account_name: str = "", tag_name: str = "", start_date: str = "", end_date: str = "", month: str = "", status: str = "", page: str = "1") -> str:
-    """Get transactions from Buxfer with optional filters: account_id, account_name, tag_name, start_date (YYYY-MM-DD), end_date (YYYY-MM-DD), month (e.g. 'jan 2024'), status (pending/cleared/reconciled), page number for pagination."""
+async def list_transactions(account_id: str = "", account_name: str = "", tag_name: str = "", start_date: str = "", end_date: str = "", month: str = "", status: str = "", transaction_type: str = "", untagged: str = "", page: str = "1") -> str:
+    """Get transactions from Buxfer with optional filters: account_id, account_name, tag_name, start_date (YYYY-MM-DD), end_date (YYYY-MM-DD), month (e.g. 'jan 2024'), status (pending/cleared/reconciled), transaction_type (e.g. expense/income/transfer), untagged ('true' to show only transactions with no tags), page number for pagination. When transaction_type or untagged is set, all pages in the date range are fetched and filtered (scope with a date range for best results)."""
     logger.info("Fetching transactions")
-    
+
     try:
         params = {}
-        
+
         if account_id:
             params["accountId"] = account_id
         if account_name:
@@ -197,53 +215,157 @@ async def list_transactions(account_id: str = "", account_name: str = "", tag_na
             params["month"] = month
         if status:
             params["status"] = status
-        if page:
-            params["page"] = page
-        
-        result = await make_buxfer_request("GET", "transactions", params=params)
-        
-        if "response" in result and "transactions" in result["response"]:
-            transactions = result["response"]["transactions"]
-            num_total = result["response"].get("numTransactions", 0)
-            
+
+        want_untagged = untagged.strip().lower() in ("true", "1", "yes")
+        client_filtering = bool(transaction_type) or want_untagged
+
+        # Build the shared filter-description line
+        filters_applied = []
+        if account_name:
+            filters_applied.append(f"Account: {account_name}")
+        elif account_id:
+            filters_applied.append(f"Account ID: {account_id}")
+        if tag_name:
+            filters_applied.append(f"Tag: {tag_name}")
+        if start_date and end_date:
+            filters_applied.append(f"Date: {start_date} to {end_date}")
+        elif month:
+            filters_applied.append(f"Month: {month}")
+        if status:
+            filters_applied.append(f"Status: {status}")
+        if transaction_type:
+            filters_applied.append(f"Type: {transaction_type}")
+        if want_untagged:
+            filters_applied.append("Untagged only")
+
+        if client_filtering:
+            transactions, num_total, truncated = await fetch_all_transactions(params)
+
+            if transaction_type:
+                transactions = [t for t in transactions if t.get("type", "").lower() == transaction_type.lower()]
+            if want_untagged:
+                transactions = [t for t in transactions if not t.get("tags")]
+
             if not transactions:
                 return "ℹ️ No transactions found matching your criteria"
-            
-            current_page = int(page) if page else 1
-            response_text = f"📋 **Buxfer Transactions** (Page {current_page}, {len(transactions)} of {num_total} total)\n\n"
-            
-            # Add filter info if filters were applied
-            filters_applied = []
-            if account_name:
-                filters_applied.append(f"Account: {account_name}")
-            elif account_id:
-                filters_applied.append(f"Account ID: {account_id}")
-            if tag_name:
-                filters_applied.append(f"Tag: {tag_name}")
-            if start_date and end_date:
-                filters_applied.append(f"Date: {start_date} to {end_date}")
-            elif month:
-                filters_applied.append(f"Month: {month}")
-            if status:
-                filters_applied.append(f"Status: {status}")
-            
+
+            total_amount = sum(float(t.get("amount", 0)) for t in transactions)
+            response_text = f"📋 **Buxfer Transactions** ({len(transactions)} matching, scanned {num_total} total)\n\n"
             if filters_applied:
                 response_text += f"**Filters:** {', '.join(filters_applied)}\n\n"
-            
+            if truncated:
+                response_text += f"⚠️ Only the most recent {MAX_AUTO_PAGES * 100} transactions were scanned — narrow the date range for a complete view.\n\n"
+
+            for txn in transactions[:MAX_DISPLAY]:
+                response_text += format_transaction(txn) + "\n\n"
+            if len(transactions) > MAX_DISPLAY:
+                response_text += f"…and {len(transactions) - MAX_DISPLAY} more (showing first {MAX_DISPLAY}).\n\n"
+
+            response_text += f"**Total matching amount: ${total_amount:,.2f}**"
+            return response_text
+
+        # Default: single-page behavior
+        if page:
+            params["page"] = page
+
+        result = await make_buxfer_request("GET", "transactions", params=params)
+
+        if "response" in result and "transactions" in result["response"]:
+            transactions = result["response"]["transactions"]
+            num_total = int(result["response"].get("numTransactions", 0))
+
+            if not transactions:
+                return "ℹ️ No transactions found matching your criteria"
+
+            current_page = int(page) if page else 1
+            response_text = f"📋 **Buxfer Transactions** (Page {current_page}, {len(transactions)} of {num_total} total)\n\n"
+
+            if filters_applied:
+                response_text += f"**Filters:** {', '.join(filters_applied)}\n\n"
+
             for txn in transactions:
                 response_text += format_transaction(txn) + "\n\n"
-            
+
             # Add pagination info
             if num_total > len(transactions):
                 total_pages = (num_total + 99) // 100  # Round up
                 response_text += f"**Page {current_page} of {total_pages}** (Use page parameter to view more)"
-            
+
             return response_text
-        
+
         return "❌ Error: Unexpected response format from Buxfer API"
-        
+
     except Exception as e:
         logger.error(f"Error listing transactions: {e}")
+        return f"❌ Error: {str(e)}"
+
+@mcp.tool()
+async def list_budgets() -> str:
+    """Get all Buxfer budgets with their limits, remaining amounts, periods, and associated tags."""
+    logger.info("Fetching budgets list")
+
+    try:
+        result = await make_buxfer_request("GET", "budgets")
+
+        if "response" in result and "budgets" in result["response"]:
+            budgets = result["response"]["budgets"]
+
+            if not budgets:
+                return "ℹ️ No budgets found"
+
+            response_text = f"📊 **Buxfer Budgets** ({len(budgets)} total)\n\n"
+
+            for budget in budgets:
+                limit = budget.get("limit", "N/A")
+                remaining = budget.get("remaining", 0)
+                response_text += f"• {budget.get('name', 'Unknown')}\n"
+                response_text += f"  ID: {budget.get('id', 'N/A')}\n"
+                response_text += f"  Limit: {limit} | Remaining: ${remaining:,.2f}\n"
+                response_text += f"  Period: {budget.get('period', 'N/A')}"
+                if budget.get("currentPeriod"):
+                    response_text += f" ({budget.get('currentPeriod')})"
+                if budget.get("tags"):
+                    response_text += f"\n  Tags: {budget.get('tags')}"
+                response_text += "\n\n"
+
+            return response_text
+
+        return "❌ Error: Unexpected response format from Buxfer API"
+
+    except Exception as e:
+        logger.error(f"Error listing budgets: {e}")
+        return f"❌ Error: {str(e)}"
+
+@mcp.tool()
+async def list_tags() -> str:
+    """Get all Buxfer transaction tags with their IDs and parent tag relationships."""
+    logger.info("Fetching tags list")
+
+    try:
+        result = await make_buxfer_request("GET", "tags")
+
+        if "response" in result and "tags" in result["response"]:
+            tags = result["response"]["tags"]
+
+            if not tags:
+                return "ℹ️ No tags found"
+
+            response_text = f"🏷️ **Buxfer Tags** ({len(tags)} total)\n\n"
+
+            for tag in tags:
+                response_text += f"• {tag.get('name', 'Unknown')}\n"
+                response_text += f"  ID: {tag.get('id', 'N/A')}"
+                parent_id = tag.get("parentId", -1)
+                if parent_id and parent_id != -1:
+                    response_text += f" | Parent ID: {parent_id}"
+                response_text += "\n\n"
+
+            return response_text
+
+        return "❌ Error: Unexpected response format from Buxfer API"
+
+    except Exception as e:
+        logger.error(f"Error listing tags: {e}")
         return f"❌ Error: {str(e)}"
 
 # === SERVER STARTUP ===

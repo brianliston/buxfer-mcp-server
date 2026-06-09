@@ -4,9 +4,8 @@ Simple Buxfer MCP Server - Manage your Buxfer transactions and accounts
 """
 import os
 import sys
+import asyncio
 import logging
-from datetime import datetime
-import json
 import httpx
 from mcp.server.fastmcp import FastMCP
 
@@ -27,11 +26,18 @@ BUXFER_TOKEN = os.environ.get("BUXFER_TOKEN", "")
 
 # === UTILITY FUNCTIONS ===
 
+def fmt_amount(value):
+    """Format a monetary value, tolerating string amounts from the API."""
+    try:
+        return f"${float(value):,.2f}"
+    except (TypeError, ValueError):
+        return str(value)
+
 def format_account(account):
     """Format a single account for display."""
     balance = account.get("balance", 0)
     last_synced = account.get("lastSynced", "Never")
-    return f"• {account.get('name', 'Unknown')} ({account.get('bank', 'N/A')})\n  ID: {account.get('id', 'N/A')}\n  Balance: ${balance:,.2f}\n  Last Synced: {last_synced}"
+    return f"• {account.get('name', 'Unknown')} ({account.get('bank', 'N/A')})\n  ID: {account.get('id', 'N/A')}\n  Balance: {fmt_amount(balance)}\n  Last Synced: {last_synced}"
 
 def format_transaction(txn):
     """Format a single transaction for display."""
@@ -43,7 +49,7 @@ def format_transaction(txn):
     
     result = f"• {txn.get('description', 'No description')} ({txn.get('date', 'No date')})\n"
     result += f"  ID: {txn.get('id', 'N/A')}\n"
-    result += f"  Type: {txn_type} | Amount: ${amount:,.2f}\n"
+    result += f"  Type: {txn_type} | Amount: {fmt_amount(amount)}\n"
     result += f"  Account: {account_name}"
     
     if status:
@@ -69,24 +75,31 @@ async def make_buxfer_request(method, endpoint, params=None, data=None):
         params = {}
     params["token"] = BUXFER_TOKEN
     
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        if method.upper() == "GET":
-            response = await client.get(url, params=params)
-        elif method.upper() == "POST":
-            response = await client.post(url, params=params, data=data)
-        else:
-            raise ValueError(f"Unsupported HTTP method: {method}")
-        
-        response.raise_for_status()
-        result = response.json()
-        
-        # Check for API-level errors
-        if "response" in result:
-            status = result["response"].get("status", "")
-            if status.startswith("ERROR"):
-                raise ValueError(f"Buxfer API error: {status}")
-        
-        return result
+    # httpx error messages include the request URL (which carries the token),
+    # so never let them propagate verbatim.
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            if method.upper() == "GET":
+                response = await client.get(url, params=params)
+            elif method.upper() == "POST":
+                response = await client.post(url, params=params, data=data)
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
+
+            response.raise_for_status()
+            result = response.json()
+    except httpx.HTTPStatusError as e:
+        raise ValueError(f"Buxfer API returned HTTP {e.response.status_code} for endpoint '{endpoint}'") from None
+    except httpx.HTTPError as e:
+        raise ValueError(f"HTTP error ({type(e).__name__}) calling Buxfer endpoint '{endpoint}'") from None
+
+    # Check for API-level errors
+    if "response" in result:
+        status = result["response"].get("status", "")
+        if status.startswith("ERROR"):
+            raise ValueError(f"Buxfer API error: {status}")
+
+    return result
 
 # === MCP TOOLS ===
 
@@ -127,7 +140,7 @@ async def add_transaction(description: str = "", amount: str = "", account_id: s
             response_text = "✅ Transaction added successfully!\n\n"
             response_text += f"ID: {txn.get('id', 'N/A')}\n"
             response_text += f"Description: {txn.get('description', 'N/A')}\n"
-            response_text += f"Amount: ${txn.get('amount', 0):,.2f}\n"
+            response_text += f"Amount: {fmt_amount(txn.get('amount', 0))}\n"
             response_text += f"Type: {txn.get('type', 'N/A')}\n"
             response_text += f"Date: {txn.get('date', 'N/A')}\n"
             response_text += f"Account: {txn.get('accountName', 'N/A')}\n"
@@ -180,7 +193,7 @@ async def edit_transaction(transaction_id: str = "", description: str = "", amou
             response_text = "✅ Transaction updated successfully!\n\n"
             response_text += f"ID: {txn.get('id', transaction_id)}\n"
             response_text += f"Description: {txn.get('description', 'N/A')}\n"
-            response_text += f"Amount: ${txn.get('amount', 0):,.2f}\n"
+            response_text += f"Amount: {fmt_amount(txn.get('amount', 0))}\n"
             response_text += f"Type: {txn.get('type', 'N/A')}\n"
             response_text += f"Date: {txn.get('date', 'N/A')}\n"
             response_text += f"Account: {txn.get('accountName', 'N/A')}\n"
@@ -217,8 +230,13 @@ async def list_accounts() -> str:
                 response_text += format_account(account) + "\n\n"
             
             # Calculate total balance
-            total_balance = sum(acc.get("balance", 0) for acc in accounts)
-            response_text += f"**Total Balance: ${total_balance:,.2f}**"
+            total_balance = 0.0
+            for acc in accounts:
+                try:
+                    total_balance += float(acc.get("balance", 0))
+                except (TypeError, ValueError):
+                    pass
+            response_text += f"**Total Balance: {fmt_amount(total_balance)}**"
             
             return response_text
         
@@ -240,15 +258,23 @@ async def fetch_all_transactions(params):
     total_pages = (num_total + 99) // 100
     pages_to_fetch = min(total_pages, MAX_AUTO_PAGES)
 
-    for p in range(2, pages_to_fetch + 1):
-        r = await make_buxfer_request("GET", "transactions", params={**params, "page": p})
-        transactions.extend(r.get("response", {}).get("transactions", []))
+    # Fetch remaining pages concurrently (bounded), preserving page order
+    semaphore = asyncio.Semaphore(5)
+
+    async def fetch_page(p):
+        async with semaphore:
+            r = await make_buxfer_request("GET", "transactions", params={**params, "page": p})
+            return r.get("response", {}).get("transactions", [])
+
+    pages = await asyncio.gather(*(fetch_page(p) for p in range(2, pages_to_fetch + 1)))
+    for page_txns in pages:
+        transactions.extend(page_txns)
 
     return transactions, num_total, total_pages > MAX_AUTO_PAGES
 
 @mcp.tool()
-async def list_transactions(account_id: str = "", account_name: str = "", tag_name: str = "", start_date: str = "", end_date: str = "", month: str = "", status: str = "", transaction_type: str = "", untagged: str = "", page: str = "1") -> str:
-    """Get transactions from Buxfer with optional filters: account_id, account_name, tag_name, start_date (YYYY-MM-DD), end_date (YYYY-MM-DD), month (e.g. 'jan 2024'), status (pending/cleared/reconciled), transaction_type (e.g. expense/income/transfer), untagged ('true' to show only transactions with no tags), page number for pagination. When transaction_type or untagged is set, all pages in the date range are fetched and filtered (scope with a date range for best results)."""
+async def list_transactions(account_id: str = "", account_name: str = "", tag_name: str = "", start_date: str = "", end_date: str = "", month: str = "", status: str = "", transaction_type: str = "", untagged: bool = False, page: str = "1") -> str:
+    """Get transactions from Buxfer with optional filters: account_id, account_name, tag_name, start_date (YYYY-MM-DD), end_date (YYYY-MM-DD), month (e.g. 'jan 2024'), status (pending/cleared/reconciled), transaction_type (e.g. expense/income/transfer), untagged (true to show only transactions with no tags), page number for pagination. When transaction_type or untagged is set, all pages in the date range are fetched and filtered (scope with a date range for best results)."""
     logger.info("Fetching transactions")
 
     try:
@@ -269,7 +295,7 @@ async def list_transactions(account_id: str = "", account_name: str = "", tag_na
         if status:
             params["status"] = status
 
-        want_untagged = untagged.strip().lower() in ("true", "1", "yes")
+        want_untagged = untagged
         client_filtering = bool(transaction_type) or want_untagged
 
         # Build the shared filter-description line
@@ -302,7 +328,12 @@ async def list_transactions(account_id: str = "", account_name: str = "", tag_na
             if not transactions:
                 return "ℹ️ No transactions found matching your criteria"
 
-            total_amount = sum(float(t.get("amount", 0)) for t in transactions)
+            total_amount = 0.0
+            for t in transactions:
+                try:
+                    total_amount += float(t.get("amount", 0))
+                except (TypeError, ValueError):
+                    pass
             response_text = f"📋 **Buxfer Transactions** ({len(transactions)} matching, scanned {num_total} total)\n\n"
             if filters_applied:
                 response_text += f"**Filters:** {', '.join(filters_applied)}\n\n"
@@ -373,7 +404,7 @@ async def list_budgets() -> str:
                 remaining = budget.get("remaining", 0)
                 response_text += f"• {budget.get('name', 'Unknown')}\n"
                 response_text += f"  ID: {budget.get('id', 'N/A')}\n"
-                response_text += f"  Limit: {limit} | Remaining: ${remaining:,.2f}\n"
+                response_text += f"  Limit: {limit} | Remaining: {fmt_amount(remaining)}\n"
                 response_text += f"  Period: {budget.get('period', 'N/A')}"
                 if budget.get("currentPeriod"):
                     response_text += f" ({budget.get('currentPeriod')})"

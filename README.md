@@ -120,6 +120,13 @@ Once installed, you can interact with your Buxfer data using natural language in
 -   **Local Storage**: The token is stored only in your local Claude configuration.
 -   **HTTPS**: All communication with Buxfer is encrypted via HTTPS.
 
+## Running Tests
+
+```bash
+pip install pytest
+python -m pytest tests/ -v
+```
+
 ## Technical Details
 
 -   **Language**: Python 3.11

@@ -1,7 +1,7 @@
 # BUXFER MCP SERVER - CLAUDE INTEGRATION GUIDE
 
 ## Overview
-This MCP server provides Claude with the ability to manage Buxfer financial transactions and accounts through three powerful tools. The server uses token-based authentication and communicates with the Buxfer API via HTTPS.
+This MCP server provides Claude with the ability to manage Buxfer financial transactions and accounts through six tools: add_transaction, edit_transaction, list_accounts, list_transactions, list_budgets, and list_tags. The server uses token-based authentication and communicates with the Buxfer API via HTTPS.
 
 ## Architecture
 
